@@ -8,8 +8,9 @@ import android.content.Intent
 import android.net.Uri
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -17,15 +18,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
-import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -35,6 +33,11 @@ import androidx.compose.ui.unit.sp
 import com.shahiid.versioninfo.model.AppVersionInfo
 import com.shahiid.versioninfo.model.DeviceInfoProvider
 import com.shahiid.versioninfo.model.DeviceDetails
+import com.shahiid.versioninfo.updater.UpdateInfo
+import com.shahiid.versioninfo.updater.UpdateManager
+import com.shahiid.versioninfo.updater.UpdateState
+import kotlinx.coroutines.launch
+import java.io.File
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -42,6 +45,7 @@ fun HomeScreen(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
     val sharedPrefs = remember {
         context.getSharedPreferences("app_settings", Context.MODE_PRIVATE)
     }
@@ -62,8 +66,8 @@ fun HomeScreen(
     var showObtainiumMissingDialog by remember { mutableStateOf(false) }
     var tempRepoInput by remember { mutableStateOf(targetRepo) }
 
-    val snackbarHostState = remember { SnackbarHostState() }
-    val coroutineScope = rememberCoroutineScope()
+    // In-App Updater State
+    var updateState by remember { mutableStateOf<UpdateState>(UpdateState.Idle) }
 
     Scaffold(
         topBar = {
@@ -87,7 +91,8 @@ fun HomeScreen(
                 actions = {
                     IconButton(onClick = {
                         appVersion = DeviceInfoProvider.getAppVersionInfo(context)
-                        Toast.makeText(context, "Refreshed Version Info", Toast.LENGTH_SHORT).show()
+                        updateState = UpdateState.Idle
+                        Toast.makeText(context, "Refreshed info", Toast.LENGTH_SHORT).show()
                     }) {
                         Icon(
                             imageVector = Icons.Default.Refresh,
@@ -100,7 +105,6 @@ fun HomeScreen(
                 )
             )
         },
-        snackbarHost = { SnackbarHost(snackbarHostState) },
         containerColor = MaterialTheme.colorScheme.background
     ) { innerPadding ->
         Column(
@@ -115,7 +119,39 @@ fun HomeScreen(
             // 1. Prominent App Version Banner Card
             VersionBannerCard(appVersion = appVersion)
 
-            // 2. Obtainium & Release Actions Card
+            // 2. In-App Direct Auto-Updater Card (No Obtainium required!)
+            InAppUpdaterCard(
+                targetRepo = targetRepo,
+                currentVersion = appVersion.versionName,
+                updateState = updateState,
+                onCheckForUpdates = {
+                    coroutineScope.launch {
+                        updateState = UpdateState.Checking
+                        updateState = UpdateManager.checkForUpdates(targetRepo, appVersion.versionName)
+                    }
+                },
+                onDownloadUpdate = { info ->
+                    coroutineScope.launch {
+                        try {
+                            val apk = UpdateManager.downloadApk(context, info) { progress ->
+                                updateState = progress
+                            }
+                            updateState = UpdateState.ReadyToInstall(apk, info)
+                            UpdateManager.promptInstall(context, apk)
+                        } catch (e: Exception) {
+                            updateState = UpdateState.Error(e.localizedMessage ?: "Download failed.")
+                        }
+                    }
+                },
+                onInstallNow = { file ->
+                    UpdateManager.promptInstall(context, file)
+                },
+                onDismissState = {
+                    updateState = UpdateState.Idle
+                }
+            )
+
+            // 3. Obtainium & Release Actions Card
             ObtainiumActionCard(
                 targetRepo = targetRepo,
                 onEditRepo = {
@@ -152,11 +188,8 @@ fun HomeScreen(
                 }
             )
 
-            // 3. Device Info Card
+            // 4. Device Info Card
             DeviceInfoCard(deviceDetails = deviceDetails)
-
-            // 4. Update Verification Guide Card
-            UpdateTestingGuideCard()
 
             Spacer(modifier = Modifier.height(16.dp))
         }
@@ -170,7 +203,7 @@ fun HomeScreen(
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        text = "Specify the GitHub owner/repo for Obtainium deep linking and release tracking.",
+                        text = "Specify the GitHub owner/repo for in-app updates and Obtainium linking.",
                         style = MaterialTheme.typography.bodyMedium
                     )
                     OutlinedTextField(
@@ -224,11 +257,11 @@ fun HomeScreen(
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        text = "Obtainium is not installed on this device or does not handle the 'obtainium://' URL scheme.",
+                        text = "Obtainium is not installed. You can still use the 'Check for Updates' button right here inside the app!",
                         style = MaterialTheme.typography.bodyMedium
                     )
                     Text(
-                        text = "You can download the latest Obtainium APK directly from its official GitHub repository.",
+                        text = "Or tap 'Get Obtainium' to install it from GitHub.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -253,7 +286,341 @@ fun HomeScreen(
 }
 
 /**
- * 1. Prominent App Version Banner Card
+ * In-App Direct Auto-Updater Card
+ */
+@Composable
+fun InAppUpdaterCard(
+    targetRepo: String,
+    currentVersion: String,
+    updateState: UpdateState,
+    onCheckForUpdates: () -> Unit,
+    onDownloadUpdate: (UpdateInfo) -> Unit,
+    onInstallNow: (File) -> Unit,
+    onDismissState: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Card(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface
+        ),
+        border = CardDefaults.outlinedCardBorder()
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Surface(
+                    shape = CircleShape,
+                    color = MaterialTheme.colorScheme.primaryContainer,
+                    modifier = Modifier.size(40.dp)
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = Icons.Default.CloudSync,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(24.dp)
+                        )
+                    }
+                }
+                Column {
+                    Text(
+                        text = "In-App Software Update",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = "Direct in-app updating (No extra app needed)",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+
+            // Main "Check for Updates" Button
+            Button(
+                onClick = onCheckForUpdates,
+                enabled = updateState !is UpdateState.Checking && updateState !is UpdateState.Downloading,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(50.dp),
+                shape = RoundedCornerShape(14.dp)
+            ) {
+                if (updateState is UpdateState.Checking) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(20.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.onPrimary
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Text(text = "Checking GitHub Releases...")
+                } else {
+                    Icon(
+                        imageVector = Icons.Default.Sync,
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Text(
+                        text = "Check for Updates",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+
+            // State Responses: Update Available
+            AnimatedVisibility(
+                visible = updateState is UpdateState.UpdateAvailable,
+                enter = fadeIn(),
+                exit = fadeOut()
+            ) {
+                if (updateState is UpdateState.UpdateAvailable) {
+                    val info = updateState.updateInfo
+                    Surface(
+                        shape = RoundedCornerShape(16.dp),
+                        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.NewReleases,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.primary
+                                    )
+                                    Text(
+                                        text = "New Update Available!",
+                                        style = MaterialTheme.typography.titleSmall,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                                SuggestionChip(
+                                    onClick = {},
+                                    label = {
+                                        Text(
+                                            text = info.tagName,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
+                                )
+                            }
+
+                            // Details: Version & File Size
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(
+                                    text = "Download Size:",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Text(
+                                    text = info.fileSizeMb,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+
+                            // Release notes snippet
+                            if (info.releaseNotes.isNotBlank()) {
+                                Text(
+                                    text = "Release Notes: ${info.releaseNotes.take(120)}...",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+
+                            Button(
+                                onClick = { onDownloadUpdate(info) },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(48.dp),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Icon(imageVector = Icons.Default.Download, contentDescription = null)
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = "Download & Install (${info.fileSizeMb})",
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // State: Downloading with Progress Bar
+            AnimatedVisibility(visible = updateState is UpdateState.Downloading) {
+                if (updateState is UpdateState.Downloading) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = "Downloading update...",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                text = "${updateState.downloadedMb} / ${updateState.totalMb} (${updateState.progressPercent}%)",
+                                style = MaterialTheme.typography.bodySmall,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        LinearProgressIndicator(
+                            progress = { updateState.progressPercent / 100f },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(8.dp)
+                                .clip(CircleShape),
+                        )
+                    }
+                }
+            }
+
+            // State: Ready to Install
+            AnimatedVisibility(visible = updateState is UpdateState.ReadyToInstall) {
+                if (updateState is UpdateState.ReadyToInstall) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            text = "✓ Download Complete! Click below if installer didn't open automatically:",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Color(0xFF2E7D32)
+                        )
+                        Button(
+                            onClick = { onInstallNow(updateState.apkFile) },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(48.dp),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color(0xFF2E7D32)
+                            )
+                        ) {
+                            Icon(imageVector = Icons.Default.Check, contentDescription = null)
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(text = "Install Update Now", fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+
+            // State: Up To Date
+            AnimatedVisibility(visible = updateState is UpdateState.UpToDate) {
+                if (updateState is UpdateState.UpToDate) {
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = Color(0xFFD7FAD9),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.CheckCircle,
+                                contentDescription = null,
+                                tint = Color(0xFF2E7D32)
+                            )
+                            Column {
+                                Text(
+                                    text = "You're up to date!",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color(0xFF0A3810)
+                                )
+                                Text(
+                                    text = "v${updateState.currentVersion} is the latest version available.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Color(0xFF0A3810).copy(alpha = 0.8f)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // State: Error
+            AnimatedVisibility(visible = updateState is UpdateState.Error) {
+                if (updateState is UpdateState.Error) {
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = MaterialTheme.colorScheme.errorContainer,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "Update Check Failed",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onErrorContainer
+                                )
+                                Text(
+                                    text = updateState.message,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onErrorContainer
+                                )
+                            }
+                            IconButton(onClick = onDismissState) {
+                                Icon(
+                                    imageVector = Icons.Default.Close,
+                                    contentDescription = "Dismiss",
+                                    tint = MaterialTheme.colorScheme.onErrorContainer
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Prominent App Version Banner Card
  */
 @Composable
 fun VersionBannerCard(
@@ -274,7 +641,6 @@ fun VersionBannerCard(
                 .padding(24.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            // Live Status Pill
             Surface(
                 shape = CircleShape,
                 color = MaterialTheme.colorScheme.primary.copy(alpha = 0.15f),
@@ -300,7 +666,6 @@ fun VersionBannerCard(
                 }
             }
 
-            // Prominent Version & Build Text
             Text(
                 text = "v${appVersion.versionName}",
                 style = MaterialTheme.typography.displayMedium,
@@ -319,7 +684,6 @@ fun VersionBannerCard(
 
             Spacer(modifier = Modifier.height(14.dp))
 
-            // Metadata Chips Row
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.Center
@@ -351,7 +715,7 @@ fun VersionBannerCard(
 }
 
 /**
- * 2. Obtainium & Release Actions Card
+ * Obtainium & Release Actions Card
  */
 @Composable
 fun ObtainiumActionCard(
@@ -397,7 +761,7 @@ fun ObtainiumActionCard(
                             fontWeight = FontWeight.Bold
                         )
                         Text(
-                            text = "One-click install & seamless auto-updates",
+                            text = "One-click install & Obtainium auto-updating",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -405,7 +769,6 @@ fun ObtainiumActionCard(
                 }
             }
 
-            // Target Repository Indicator with Edit Action
             Surface(
                 shape = RoundedCornerShape(12.dp),
                 color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
@@ -445,12 +808,11 @@ fun ObtainiumActionCard(
                 }
             }
 
-            // Primary Action Button: Add / Check in Obtainium
             Button(
                 onClick = onOpenObtainium,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(52.dp),
+                    .height(50.dp),
                 shape = RoundedCornerShape(14.dp),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = MaterialTheme.colorScheme.primary
@@ -469,7 +831,6 @@ fun ObtainiumActionCard(
                 )
             }
 
-            // Secondary Action Button: Open GitHub Releases
             OutlinedButton(
                 onClick = onOpenGitHubReleases,
                 modifier = Modifier
@@ -484,12 +845,11 @@ fun ObtainiumActionCard(
                 )
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(
-                    text = "Open GitHub Releases",
+                    text = "Open GitHub Releases Page",
                     style = MaterialTheme.typography.labelLarge
                 )
             }
 
-            // Deep Link Copy helper
             TextButton(
                 onClick = onCopyDeepLink,
                 modifier = Modifier.fillMaxWidth()
@@ -510,7 +870,7 @@ fun ObtainiumActionCard(
 }
 
 /**
- * 3. Device Info Card
+ * Device Info Card
  */
 @Composable
 fun DeviceInfoCard(
@@ -549,7 +909,6 @@ fun DeviceInfoCard(
 
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
 
-            // Spec Rows
             InfoRow(label = "Model", value = "${deviceDetails.manufacturer} ${deviceDetails.model}")
             InfoRow(label = "Android Version", value = "Android ${deviceDetails.androidVersion}")
             InfoRow(label = "SDK API Level", value = "API ${deviceDetails.sdkInt}")
@@ -583,106 +942,5 @@ private fun InfoRow(
             color = MaterialTheme.colorScheme.onSurface,
             textAlign = TextAlign.End
         )
-    }
-}
-
-/**
- * 4. Update Verification Guide Card
- */
-@Composable
-fun UpdateTestingGuideCard(
-    modifier: Modifier = Modifier
-) {
-    Card(
-        modifier = modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(20.dp),
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)
-        )
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(20.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.Default.CheckCircle,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.size(20.dp)
-                )
-                Text(
-                    text = "How to Test Auto-Updating",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.Bold
-                )
-            }
-
-            StepRow(
-                step = "1",
-                title = "Install Initial Release",
-                description = "Add this app to Obtainium using the button above and install v1.0.0."
-            )
-            StepRow(
-                step = "2",
-                title = "Bump Version in Code",
-                description = "Update versionName = \"1.0.1\" and versionCode = 2 in app/build.gradle.kts."
-            )
-            StepRow(
-                step = "3",
-                title = "Push Git Tag",
-                description = "Run: git tag v1.0.1 && git push origin v1.0.1 to trigger GitHub Actions."
-            )
-            StepRow(
-                step = "4",
-                title = "Check Updates in Obtainium",
-                description = "Open Obtainium, tap check updates, and install. The banner will immediately reflect v1.0.1!"
-            )
-        }
-    }
-}
-
-@Composable
-private fun StepRow(
-    step: String,
-    title: String,
-    description: String
-) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-        verticalAlignment = Alignment.Top
-    ) {
-        Surface(
-            shape = CircleShape,
-            color = MaterialTheme.colorScheme.primary,
-            modifier = Modifier.size(22.dp)
-        ) {
-            Box(contentAlignment = Alignment.Center) {
-                Text(
-                    text = step,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onPrimary,
-                    fontWeight = FontWeight.Bold
-                )
-            }
-        }
-        Column(modifier = Modifier.weight(1f)) {
-            Text(
-                text = title,
-                style = MaterialTheme.typography.labelMedium,
-                fontWeight = FontWeight.Bold
-            )
-            Text(
-                text = description,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
     }
 }
