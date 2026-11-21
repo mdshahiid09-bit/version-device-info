@@ -37,82 +37,124 @@ sealed class UpdateState {
 
 object UpdateManager {
 
+    private fun cleanRepo(repoPath: String): String {
+        return repoPath.trim()
+            .replace("https://", "")
+            .replace("http://", "")
+            .replace("github.com/", "")
+            .replace("www.github.com/", "")
+            .trim('/')
+    }
+
     suspend fun checkForUpdates(
         repoPath: String,
         currentVersion: String
     ): UpdateState = withContext(Dispatchers.IO) {
+        val cleanRepo = cleanRepo(repoPath)
+        if (cleanRepo.isBlank() || !cleanRepo.contains("/")) {
+            return@withContext UpdateState.Error("Invalid repository format: '$cleanRepo'. Expected 'owner/repo'.")
+        }
+
+        var tagName = ""
+        var releaseName = ""
+        var releaseNotes = ""
+        var apkUrl = ""
+        var apkName = ""
+        var apkSizeBytes: Long = 0
+
+        // Strategy 1: GitHub API
         try {
-            val cleanRepo = repoPath.trim().removePrefix("https://github.com/").trim('/')
             val apiUrl = "https://api.github.com/repos/$cleanRepo/releases/latest"
-            val connection = (URL(apiUrl).openConnection() as HttpURLConnection).apply {
+            val conn = (URL(apiUrl).openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
-                setRequestProperty("Accept", "application/vnd.github.v3+json")
-                setRequestProperty("User-Agent", "VersionDeviceInfo-App")
-                connectTimeout = 12000
-                readTimeout = 12000
+                setRequestProperty("Accept", "application/vnd.github+json")
+                setRequestProperty("User-Agent", "VersionDeviceInfoApp/1.0")
+                connectTimeout = 10000
+                readTimeout = 10000
             }
 
-            if (connection.responseCode != 200) {
-                return@withContext UpdateState.Error("GitHub responded with status ${connection.responseCode}")
-            }
-
-            val jsonString = connection.inputStream.bufferedReader().use { it.readText() }
-            val releaseObj = JSONObject(jsonString)
-
-            val tagName = releaseObj.optString("tag_name", "").trim()
-            val releaseName = releaseObj.optString("name", tagName)
-            val releaseNotes = releaseObj.optString("body", "No release notes provided.")
-            val assetsArray = releaseObj.optJSONArray("assets")
-
-            if (assetsArray == null || assetsArray.length() == 0) {
-                return@withContext UpdateState.Error("No release assets found.")
-            }
-
-            var apkUrl = ""
-            var apkName = ""
-            var apkSizeBytes: Long = 0
-
-            for (i in 0 until assetsArray.length()) {
-                val asset = assetsArray.getJSONObject(i)
-                val name = asset.optString("name", "")
-                if (name.endsWith(".apk", ignoreCase = true)) {
-                    apkUrl = asset.optString("browser_download_url", "")
-                    apkName = name
-                    apkSizeBytes = asset.optLong("size", 0L)
-                    break
+            if (conn.responseCode == 200) {
+                val jsonString = conn.inputStream.bufferedReader().use { it.readText() }
+                val releaseObj = JSONObject(jsonString)
+                tagName = releaseObj.optString("tag_name", "").trim()
+                releaseName = releaseObj.optString("name", tagName)
+                releaseNotes = releaseObj.optString("body", "")
+                val assets = releaseObj.optJSONArray("assets")
+                if (assets != null) {
+                    for (i in 0 until assets.length()) {
+                        val asset = assets.getJSONObject(i)
+                        val name = asset.optString("name", "")
+                        if (name.endsWith(".apk", ignoreCase = true)) {
+                            apkUrl = asset.optString("browser_download_url", "")
+                            apkName = name
+                            apkSizeBytes = asset.optLong("size", 0L)
+                            break
+                        }
+                    }
                 }
             }
+        } catch (_: Exception) {
+            // Fallback to strategy 2 if API is rate limited or fails
+        }
 
-            if (apkUrl.isBlank()) {
-                return@withContext UpdateState.Error("No APK asset found in the latest release.")
+        // Strategy 2: Web 302 Redirect Fallback (Never rate limited by GitHub)
+        if (tagName.isBlank() || apkUrl.isBlank()) {
+            try {
+                val webUrl = "https://github.com/$cleanRepo/releases/latest"
+                val webConn = (URL(webUrl).openConnection() as HttpURLConnection).apply {
+                    instanceFollowRedirects = false
+                    setRequestProperty("User-Agent", "Mozilla/5.0 (Android; Mobile)")
+                    connectTimeout = 10000
+                    readTimeout = 10000
+                }
+                val redirectUrl = webConn.getHeaderField("Location") ?: ""
+                if (redirectUrl.contains("/releases/tag/")) {
+                    tagName = redirectUrl.substringAfter("/releases/tag/").trim('/')
+                    releaseName = "Release $tagName"
+                    apkName = "version-info-$tagName.apk"
+                    apkUrl = "https://github.com/$cleanRepo/releases/download/$tagName/$apkName"
+                    try {
+                        val headConn = (URL(apkUrl).openConnection() as HttpURLConnection).apply {
+                            requestMethod = "HEAD"
+                            instanceFollowRedirects = true
+                            setRequestProperty("User-Agent", "VersionDeviceInfoApp/1.0")
+                            connectTimeout = 8000
+                        }
+                        apkSizeBytes = headConn.contentLengthLong
+                    } catch (_: Exception) {}
+                }
+            } catch (e: Exception) {
+                return@withContext UpdateState.Error("Network error: ${e.localizedMessage ?: "Failed to connect to GitHub"}")
             }
+        }
 
-            val sizeInMb = if (apkSizeBytes > 0) {
-                String.format(Locale.US, "%.1f MB", apkSizeBytes / (1024.0 * 1024.0))
-            } else {
-                "Unknown size"
-            }
+        if (tagName.isBlank() || apkUrl.isBlank()) {
+            return@withContext UpdateState.Error("No releases or APK found on GitHub for '$cleanRepo'.")
+        }
 
-            val remoteVer = tagName.removePrefix("v").removePrefix("V").trim()
-            val localVer = currentVersion.removePrefix("v").removePrefix("V").trim()
+        val sizeInMb = if (apkSizeBytes > 0) {
+            String.format(Locale.US, "%.1f MB", apkSizeBytes / (1024.0 * 1024.0))
+        } else {
+            "~11 MB"
+        }
 
-            val isNewer = isVersionNewer(remoteVer, localVer)
-            if (isNewer) {
-                val updateInfo = UpdateInfo(
-                    tagName = tagName,
-                    releaseName = releaseName,
-                    releaseNotes = releaseNotes,
-                    downloadUrl = apkUrl,
-                    apkName = apkName,
-                    fileSizeMb = sizeInMb,
-                    sizeBytes = apkSizeBytes
-                )
-                UpdateState.UpdateAvailable(updateInfo)
-            } else {
-                UpdateState.UpToDate(currentVersion)
-            }
-        } catch (e: Exception) {
-            UpdateState.Error(e.localizedMessage ?: "Failed to check for updates.")
+        val remoteVer = tagName.removePrefix("v").removePrefix("V").trim()
+        val localVer = currentVersion.removePrefix("v").removePrefix("V").trim()
+
+        val isNewer = isVersionNewer(remoteVer, localVer)
+        if (isNewer) {
+            val updateInfo = UpdateInfo(
+                tagName = tagName,
+                releaseName = releaseName,
+                releaseNotes = releaseNotes,
+                downloadUrl = apkUrl,
+                apkName = apkName,
+                fileSizeMb = sizeInMb,
+                sizeBytes = apkSizeBytes
+            )
+            UpdateState.UpdateAvailable(updateInfo)
+        } else {
+            UpdateState.UpToDate(currentVersion)
         }
     }
 
@@ -140,30 +182,38 @@ object UpdateManager {
         val destinationFile = File(updatesDir, updateInfo.apkName)
         if (destinationFile.exists()) destinationFile.delete()
 
-        var connection = (URL(updateInfo.downloadUrl).openConnection() as HttpURLConnection).apply {
-            instanceFollowRedirects = true
-            setRequestProperty("User-Agent", "VersionDeviceInfo-App")
-            connectTimeout = 15000
-            readTimeout = 15000
-        }
+        // Follow redirects in a loop (GitHub to AWS S3 CDN)
+        var currentUrl = updateInfo.downloadUrl
+        var connection: HttpURLConnection
+        var redirectCount = 0
 
-        var redirect = false
-        val status = connection.responseCode
-        if (status == HttpURLConnection.HTTP_MOVED_TEMP || status == HttpURLConnection.HTTP_MOVED_PERM || status == HttpURLConnection.HTTP_SEE_OTHER) {
-            redirect = true
-        }
-
-        if (redirect) {
-            val newUrl = connection.getHeaderField("Location")
-            connection = (URL(newUrl).openConnection() as HttpURLConnection).apply {
-                setRequestProperty("User-Agent", "VersionDeviceInfo-App")
+        while (true) {
+            connection = (URL(currentUrl).openConnection() as HttpURLConnection).apply {
+                instanceFollowRedirects = false
+                setRequestProperty("User-Agent", "VersionDeviceInfoApp/1.0")
                 connectTimeout = 15000
                 readTimeout = 15000
+            }
+            val status = connection.responseCode
+            if (status == HttpURLConnection.HTTP_MOVED_TEMP ||
+                status == HttpURLConnection.HTTP_MOVED_PERM ||
+                status == HttpURLConnection.HTTP_SEE_OTHER ||
+                status == 307 || status == 308
+            ) {
+                currentUrl = connection.getHeaderField("Location") ?: break
+                redirectCount++
+                if (redirectCount > 6) break
+            } else {
+                break
             }
         }
 
         val totalLength = connection.contentLengthLong.let { if (it > 0) it else updateInfo.sizeBytes }
-        val totalMbStr = String.format(Locale.US, "%.1f MB", totalLength / (1024.0 * 1024.0))
+        val totalMbStr = if (totalLength > 0) {
+            String.format(Locale.US, "%.1f MB", totalLength / (1024.0 * 1024.0))
+        } else {
+            updateInfo.fileSizeMb
+        }
 
         connection.inputStream.use { input ->
             FileOutputStream(destinationFile).use { output ->
@@ -174,7 +224,7 @@ object UpdateManager {
                 while (input.read(buffer).also { bytesRead = it } != -1) {
                     output.write(buffer, 0, bytesRead)
                     totalBytesRead += bytesRead
-                    val percent = if (totalLength > 0) ((totalBytesRead * 100) / totalLength).toInt() else 0
+                    val percent = if (totalLength > 0) ((totalBytesRead * 100) / totalLength).toInt().coerceIn(0, 100) else 0
                     val currentMbStr = String.format(Locale.US, "%.1f MB", totalBytesRead / (1024.0 * 1024.0))
                     onProgress(
                         UpdateState.Downloading(
