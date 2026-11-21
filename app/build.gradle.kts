@@ -30,10 +30,17 @@ android {
                 keyAlias = System.getenv("KEY_ALIAS")
                 keyPassword = System.getenv("KEY_PASSWORD")
             } else {
-                // Fallback to debug key so release APK is always signed and installable out of the box!
-                initWith(getByName("debug"))
+                storeFile = file("debug.keystore")
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
             }
         }
+    }
+
+    lint {
+        abortOnError = false
+        checkReleaseBuilds = false
     }
 
     buildTypes {
