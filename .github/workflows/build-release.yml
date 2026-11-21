@@ -1,0 +1,107 @@
+name: Build & Release APK
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release Tag (e.g. v1.0.0)'
+        required: false
+        default: 'v1.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Publish Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Grant Execute Permission to Gradlew
+        run: chmod +x gradlew
+
+      - name: Build Release APK
+        run: ./gradlew assembleRelease --stacktrace
+
+      - name: Prepare APK & Checksum
+        id: prepare_apk
+        run: |
+          # Determine tag name from git ref or manual input
+          TAG="${{ github.ref_name }}"
+          if [ -z "$TAG" ] || [ "$TAG" = "main" ] || [ "$TAG" = "master" ]; then
+            TAG="${{ github.event.inputs.release_tag || 'v1.0.0' }}"
+          fi
+          echo "TAG=$TAG" >> "$GITHUB_OUTPUT"
+
+          # Define APK paths
+          SOURCE_APK="app/build/outputs/apk/release/app-release.apk"
+          OUTPUT_APK="version-info-${TAG}.apk"
+
+          if [ ! -f "$SOURCE_APK" ]; then
+            echo "Error: Release APK not found at $SOURCE_APK"
+            exit 1
+          fi
+
+          cp "$SOURCE_APK" "$OUTPUT_APK"
+          SHA256=$(sha256sum "$OUTPUT_APK" | awk '{print $1}')
+          echo "APK_PATH=$OUTPUT_APK" >> "$GITHUB_OUTPUT"
+          echo "APK_SHA256=$SHA256" >> "$GITHUB_OUTPUT"
+          echo "Built: $OUTPUT_APK (SHA256: $SHA256)"
+
+      - name: Generate Changelog & Release Notes
+        id: release_notes
+        run: |
+          TAG="${{ steps.prepare_apk.outputs.TAG }}"
+          SHA256="${{ steps.prepare_apk.outputs.APK_SHA256 }}"
+          APK_NAME="${{ steps.prepare_apk.outputs.APK_PATH }}"
+
+          cat <<EOF > RELEASE_NOTES.md
+          ## Version & Device Info ${TAG}
+
+          Automated release build generated for seamless testing with **Obtainium** and GitHub Releases.
+
+          ### 📦 Download & Verification
+          | Attribute | Value |
+          |---|---|
+          | **Filename** | \`${APK_NAME}\` |
+          | **Tag** | \`${TAG}\` |
+          | **SHA-256** | \`${SHA256}\` |
+
+          ### 📲 Obtainium One-Click Setup
+          Click or copy the Obtainium deep-link to track and auto-update this app:
+          \`\`\`
+          obtainium://app/https://github.com/${{ github.repository }}
+          \`\`\`
+
+          Direct APK download link:
+          [Download ${APK_NAME}](https://github.com/${{ github.repository }}/releases/download/${TAG}/${APK_NAME})
+          EOF
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.prepare_apk.outputs.TAG }}
+          name: "Release ${{ steps.prepare_apk.outputs.TAG }}"
+          body_path: RELEASE_NOTES.md
+          draft: false
+          prerelease: false
+          files: ${{ steps.prepare_apk.outputs.APK_PATH }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
